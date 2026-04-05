@@ -1,0 +1,101 @@
+rules_version='2'
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── CATCH-ALL: deny every collection not listed below ──────────────
+    // Firestore evaluates rules as OR — this acts as the default-deny
+    // baseline. Explicit rules below grant access for known paths only.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ── EXPLICITLY BLOCK user identity data ────────────────────────────
+    // Pre-emptively block /users even if it never gets created.
+    // Also blocks any future admin panel that might store user bios.
+    match /users/{any} {
+      allow read, write: if false;
+    }
+
+    // ── Feed posts ──────────────────────────────────────────────────────
+    // authorUid stored in docs is the SHA-256 hash — not the real uid.
+    // upvotedBy / downvotedBy / pollVoters also store hashes, not real uids.
+    match /posts/{postId} {
+      // Allow unauthenticated reads so shared post links work for non-users
+      allow read: if true;
+
+      // Create: must be logged in. authorUid must be a non-empty string
+      // (we trust the client hash; backend validation via Cloud Functions
+      // would be the next hardening step for production).
+      allow create: if request.auth != null
+                    && request.resource.data.authorUid is string
+                    && request.resource.data.authorUid.size() > 0;
+
+      // Update: only for vote/comment-count field mutations
+      // Deny arbitrary field writes (e.g., someone trying to overwrite text).
+      allow update: if request.auth != null
+                    && onlyVoteFields(request.resource.data.diff(resource.data).changedKeys());
+
+      // No deletes ever
+      allow delete: if false;
+
+      match /comments/{commentId} {
+        allow read: if request.auth != null;
+        allow create: if request.auth != null
+                      && request.resource.data.authorUid is string
+                      && request.resource.data.text is string
+                      && request.resource.data.text.size() <= 200;
+        allow update, delete: if false;
+      }
+    }
+
+    // ── Course reviews ──────────────────────────────────────────────────
+    // Doc ID is the hashed uid — enforces one review per user per course.
+    match /courseReviews/{courseId}/reviews/{reviewId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+                             && request.resource.data.uid is string
+                             && request.resource.data.cpiThreat is int
+                             && request.resource.data.cpiThreat >= 1
+                             && request.resource.data.cpiThreat <= 5;
+      allow delete: if false;
+    }
+
+    // ── Course materials ────────────────────────────────────────────────
+    match /courseMaterials/{courseId}/materials/{docId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+                    && request.resource.data.uid is string
+                    && request.resource.data.title is string
+                    && request.resource.data.title.size() > 0
+                    && request.resource.data.link is string
+                    && request.resource.data.link.size() > 0;
+      allow update, delete: if false;
+    }
+
+    // ── Collection Group: Materials ─────────────────────────────────────
+    // Allows querying across all /materials subcollections to check global counts.
+    match /{path=**}/materials/{docId} {
+      allow read: if request.auth != null;
+    }
+
+    // ── FCM Push Notification Tokens ──────────────────────────────────
+    // One document per user (keyed by hashed uid).
+    // Users can create/update their own token, read for buzz dispatch.
+    match /fcmTokens/{tokenDocId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+                            && request.resource.data.token is string
+                            && request.resource.data.token.size() > 0;
+      allow delete: if request.auth != null;
+    }
+  }
+}
+
+// ── Helper: only vote / comment-count fields are mutable on a post ─────
+function onlyVoteFields(keys) {
+  return keys.hasOnly([
+    'upvoteCount', 'downvoteCount', 'upvotedBy', 'downvotedBy',
+    'commentCount', 'pollVoters', 'buzzNotified'
+  ]);
+}
